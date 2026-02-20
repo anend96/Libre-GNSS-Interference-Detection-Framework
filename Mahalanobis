@@ -1,0 +1,1303 @@
+#!/usr/bin/env python3
+"""
+Angulus PoC (robust version):
+Nominal-only Mahalanobis anomaly detector on GNSS raw I/Q (.mat) dataset.
+
+Key improvements over the initial version:
+- More flexible and explicit file parsing with logging.
+- Safer MAT loading (logs which key is used, better error messages).
+- Per-file error handling so one bad file does not kill the whole run.
+- Sanity checks on feature matrices and scores (NaN/Inf detection).
+- Uses LedoitWolf.location_ as the mean estimate.
+- Optional verbosity control via --log_level.
+- Configurable window size limits and detection thresholds.
+
+Expected dataset layout (example):
+  data/oct_18/S1_50.mat
+  data/oct_18/SS1_50.mat
+  data/oct_19/S3_120.mat
+  ...
+
+Design:
+- Train on clean files only (prefix 'S')
+- Test on spoofed files only (prefix 'SS')
+- Use interpretable RF features computed on windowed I/Q
+- Use Ledoit-Wolf shrinkage covariance for stable Mahalanobis scoring
+"""
+
+from __future__ import annotations
+
+import argparse
+import glob
+import logging
+import os
+import re
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Tuple
+
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.io import loadmat
+from scipy.signal import welch, resample_poly
+from scipy.stats import kurtosis
+from sklearn.covariance import LedoitWolf
+from sklearn.preprocessing import StandardScaler
+
+
+# -------------------------
+# Logging setup
+# -------------------------
+
+LOGGER = logging.getLogger("mahalanobis_gnss")
+
+
+def setup_logging(level: str = "INFO") -> None:
+    level = level.upper()
+    if level not in {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}:
+        level = "INFO"
+    logging.basicConfig(
+        level=getattr(logging, level),
+        format="[%(asctime)s] [%(levelname)s] %(message)s",
+    )
+    LOGGER.setLevel(getattr(logging, level))
+
+
+# -------------------------
+# Utilities: file discovery
+# -------------------------
+
+SPOOF_PREFIX = "SS"
+CLEAN_PREFIX = "S"
+
+# More flexible: allow any integer after S/SS, then underscore, then integer (e.g. S1_50.mat, S10_120.mat)
+# Groups: (1) prefix S/SS, (2) category 1-4, (3) sample sequence
+MAT_RE = re.compile(r"^(SS|S)(\d+)_([0-9]+)\.mat$", re.IGNORECASE)
+
+# Sampling rates by category (from dataset documentation)
+# Category 1: Baseline (25 MHz)
+# Category 2: Multipath (25 MHz)
+# Category 3: High Sampling Rate (50 MHz)
+# Category 4: Low Quantization (25 MHz)
+CATEGORY_FS_HZ = {
+    1: 25e6,
+    2: 25e6,
+    3: 50e6,
+    4: 25e6,
+}
+DEFAULT_FS_HZ = 25e6
+
+
+def find_mat_files(
+    root: str,
+    categories: Optional[List[int]] = None
+) -> Tuple[List[Tuple[str, int]], List[Tuple[str, int]]]:
+    """
+    Return (clean_files, spoof_files) from a root directory.
+    
+    Each entry is a tuple of (file_path, category).
+    
+    Args:
+        root: Root directory to search
+        categories: If provided, only include files from these categories (1-4)
+    """
+    all_files = glob.glob(os.path.join(root, "**", "*.mat"), recursive=True)
+    clean: List[Tuple[str, int]] = []
+    spoof: List[Tuple[str, int]] = []
+    skipped: List[str] = []
+
+    for f in all_files:
+        base = os.path.basename(f)
+        m = MAT_RE.match(base)
+        if not m:
+            skipped.append(f)
+            continue
+        
+        prefix = m.group(1).upper()
+        category = int(m.group(2))
+        # seq = int(m.group(3))  # sample sequence, for reference
+        
+        # Filter by category if specified
+        if categories is not None and category not in categories:
+            skipped.append(f)
+            continue
+        
+        if prefix == CLEAN_PREFIX:
+            clean.append((f, category))
+        elif prefix == SPOOF_PREFIX:
+            spoof.append((f, category))
+        else:
+            skipped.append(f)
+
+    # Sort by path
+    clean.sort(key=lambda x: x[0])
+    spoof.sort(key=lambda x: x[0])
+
+    LOGGER.info(
+        "Discovered %d clean files, %d spoof files, %d skipped.",
+        len(clean),
+        len(spoof),
+        len(skipped),
+    )
+    
+    if categories:
+        LOGGER.info("Filtering to categories: %s", categories)
+    
+    # Log category distribution
+    if clean:
+        cat_counts = {}
+        for _, cat in clean:
+            cat_counts[cat] = cat_counts.get(cat, 0) + 1
+        LOGGER.debug("Clean files by category: %s", cat_counts)
+    
+    if skipped:
+        LOGGER.debug("Skipped files (name did not match pattern): %s", skipped[:10])
+
+    return clean, spoof
+
+
+# -------------------------
+# MAT loading heuristics
+# -------------------------
+
+# MAT file magic bytes for version detection
+MAT_V5_HEADER = b'MATLAB 5.0'
+MAT_V4_NUMERIC_TYPES = {0, 1, 2, 3, 4, 5}  # v4 uses different structure
+
+
+def validate_mat_header(path: str) -> str:
+    """
+    Validate MAT file header and return version info.
+    
+    Returns:
+        Version string: 'v4', 'v5', 'v7', 'v7.3', or 'unknown'
+    
+    Raises:
+        ValueError: If file is not a valid MAT file
+    """
+    try:
+        with open(path, 'rb') as f:
+            header = f.read(128)
+    except IOError as e:
+        raise ValueError(f"Cannot read file {path}: {e}") from e
+    
+    if len(header) < 128:
+        raise ValueError(f"File too small to be a valid MAT file: {path}")
+    
+    # Check for MAT v5/v6/v7 header (starts with 'MATLAB 5.0')
+    if header[:10] == MAT_V5_HEADER:
+        # Check for v7.3 (HDF5-based) - has different subsystem offset
+        subsys_offset = header[117:124]
+        if b'\x00\x01IM' in header[124:128] or b'MI\x00' in header[124:128]:
+            # Check endianness indicator
+            if header[126:128] == b'IM':
+                return 'v5-v7 (little-endian)'
+            elif header[126:128] == b'MI':
+                return 'v5-v7 (big-endian)'
+        return 'v5-v7'
+    
+    # Check for HDF5 (v7.3) - starts with HDF5 signature
+    if header[:8] == b'\x89HDF\r\n\x1a\n':
+        return 'v7.3 (HDF5)'
+    
+    # Could be MAT v4 (no standard header, starts with data)
+    # v4 files start with a 20-byte header per variable
+    if len(header) >= 20:
+        # v4 type field is in bytes 0-3 (little-endian int)
+        import struct
+        try:
+            mtype = struct.unpack('<I', header[0:4])[0]
+            mrows = struct.unpack('<I', header[4:8])[0]
+            mcols = struct.unpack('<I', header[8:12])[0]
+            # Sanity check for v4 format
+            if mtype < 100 and mrows < 1e8 and mcols < 1e8:
+                return 'v4 (legacy)'
+        except struct.error:
+            pass
+    
+    raise ValueError(
+        f"File does not appear to be a valid MAT file: {path}. "
+        f"Header bytes: {header[:20]!r}"
+    )
+
+
+# Common metadata keys to search for
+METADATA_KEYS = {
+    'fs': ['fs', 'Fs', 'FS', 'sample_rate', 'sampleRate', 'SampleRate', 'sr'],
+    'fc': ['fc', 'Fc', 'FC', 'center_freq', 'centerFreq', 'CenterFreq', 'f_center'],
+    'bw': ['bw', 'Bw', 'BW', 'bandwidth', 'Bandwidth'],
+}
+
+
+def extract_metadata_from_mat(mat: dict) -> dict:
+    """
+    Extract common metadata fields from a loaded MAT file.
+    
+    Returns dict with keys like 'fs', 'fc', 'bw' if found.
+    """
+    metadata = {}
+    
+    for standard_key, possible_names in METADATA_KEYS.items():
+        for name in possible_names:
+            if name in mat:
+                val = mat[name]
+                # Extract scalar value
+                if hasattr(val, 'flat'):
+                    try:
+                        metadata[standard_key] = float(val.flat[0])
+                        LOGGER.debug(
+                            "Found metadata '%s' = %s (from key '%s')",
+                            standard_key, metadata[standard_key], name
+                        )
+                        break
+                    except (IndexError, ValueError, TypeError):
+                        continue
+                elif isinstance(val, (int, float)):
+                    metadata[standard_key] = float(val)
+                    break
+    
+    return metadata
+
+def _as_complex(arr: np.ndarray) -> Optional[np.ndarray]:
+    """Try to interpret arr as complex IQ. Returns complex array or None."""
+    if np.iscomplexobj(arr):
+        return arr.astype(np.complex64).ravel()
+
+    if arr.ndim == 2:
+        # common: [N,2] or [2,N] with I,Q
+        if arr.shape[1] == 2:
+            return (arr[:, 0] + 1j * arr[:, 1]).astype(np.complex64).ravel()
+        if arr.shape[0] == 2:
+            return (arr[0, :] + 1j * arr[1, :]).astype(np.complex64).ravel()
+
+    # Could add more patterns here if needed
+    return None
+
+
+def load_iq_from_mat(path: str, validate_header: bool = True) -> Tuple[np.ndarray, Dict]:
+    """
+    Load IQ samples from .mat file. Tries common keys:
+    - 'iq', 'IQ', 'samples', 'x', 'data', 'sig', 'signal', etc.
+    If not found, searches for the largest numeric array that can be parsed as complex.
+
+    Args:
+        path: Path to .mat file
+        validate_header: If True, validate MAT file header before loading
+
+    Returns:
+        iq_complex: 1D complex64 array of IQ samples
+        meta_dict: metadata dict with '_iq_key_used', '_mat_version', and any extracted metadata
+    """
+    # Validate header first
+    if validate_header:
+        try:
+            mat_version = validate_mat_header(path)
+            LOGGER.debug("MAT file %s: version=%s", os.path.basename(path), mat_version)
+        except ValueError as e:
+            raise RuntimeError(str(e)) from e
+    else:
+        mat_version = 'unknown'
+    
+    # Check for HDF5 format (v7.3) which requires h5py
+    if 'HDF5' in mat_version:
+        try:
+            import h5py
+            with h5py.File(path, 'r') as f:
+                LOGGER.debug("Loading v7.3 MAT file with h5py")
+                # HDF5 MAT files have different structure
+                data_keys = list(f.keys())
+                LOGGER.debug("HDF5 keys: %s", data_keys)
+                # This is a simplified loader; full v7.3 support is complex
+                raise NotImplementedError(
+                    f"MAT v7.3 (HDF5) files require specialized handling. "
+                    f"Consider saving as v7 or earlier. Keys found: {data_keys}"
+                )
+        except ImportError:
+            raise RuntimeError(
+                f"File {path} is MAT v7.3 (HDF5) format but h5py is not installed. "
+                f"Install with: pip install h5py"
+            )
+    
+    # Load with scipy for v4-v7
+    try:
+        mat = loadmat(path)
+    except Exception as e:
+        raise RuntimeError(f"Failed to load MAT file {path}: {e}") from e
+
+    # Log available keys for diagnostics
+    data_keys = [k for k in mat.keys() if not k.startswith("__")]
+    LOGGER.debug("Available keys in %s: %s", os.path.basename(path), data_keys)
+
+    # Initialize metadata with version and extracted fields
+    meta: Dict[str, object] = {
+        "_available_keys": data_keys,
+        "_mat_version": mat_version,
+    }
+    
+    # Extract any metadata (fs, fc, bw, etc.)
+    extracted_meta = extract_metadata_from_mat(mat)
+    meta.update(extracted_meta)
+
+    candidate_keys = ["iq", "IQ", "Iq", "samples", "x", "data", "sig", "signal"]
+    for k in candidate_keys:
+        if k in mat:
+            arr = np.asarray(mat[k])
+            iq = _as_complex(arr)
+            if iq is not None and iq.size > 1000:
+                meta["_iq_key_used"] = k
+                meta["_iq_length"] = iq.size
+                LOGGER.debug(
+                    "Using key '%s' from %s as IQ (len=%d).",
+                    k,
+                    os.path.basename(path),
+                    iq.size,
+                )
+                return iq, meta
+
+    # Otherwise search all variables for largest numeric candidate
+    best_iq: Optional[np.ndarray] = None
+    best_size = 0
+    best_key: Optional[str] = None
+
+    for k, v in mat.items():
+        if k.startswith("__"):
+            continue
+        arr = np.asarray(v)
+        if not (np.issubdtype(arr.dtype, np.number) or np.iscomplexobj(arr)):
+            continue
+        iq = _as_complex(arr)
+        if iq is None:
+            continue
+        if iq.size > best_size:
+            best_iq = iq
+            best_size = iq.size
+            best_key = k
+
+    if best_iq is None:
+        raise ValueError(
+            f"Could not find complex IQ array in {path}. "
+            f"Numeric keys seen: {[k for k, v in mat.items() if not k.startswith('__') and isinstance(v, np.ndarray)]}"
+        )
+
+    meta["_iq_key_used"] = best_key
+    LOGGER.debug(
+        "Using key '%s' from %s as IQ (len=%d) [fallback].",
+        best_key,
+        os.path.basename(path),
+        best_size,
+    )
+    return best_iq, meta
+
+
+# -------------------------
+# Feature extraction
+# -------------------------
+
+# Feature names for interpretability
+FEATURE_NAMES = [
+    "total_power_db",
+    "noise_floor_db",
+    "spectral_entropy",
+    "spectral_flatness",
+    "psd_variance",
+    "amp_kurtosis",
+    "amp_std",
+]
+
+
+@dataclass
+class FeatureConfig:
+    fs_hz: float
+    win_ms: float = 1.0          # Window length in ms
+    hop_ms: float = 1.0          # Hop length in ms
+    max_windows_per_file: int = 200
+    min_win_samples: int = 1024  # Minimum window size in samples
+    # Optional downsampling target to reduce compute while keeping spectral shape stats stable
+    target_fs_hz: Optional[float] = 5e6
+    welch_nperseg: int = 2048
+    welch_noverlap: int = 1024
+
+
+# Maximum acceptable downsample ratio approximation error
+MAX_DOWNSAMPLE_ERROR = 0.01  # 1%
+
+
+def normalize_rms(iq: np.ndarray) -> np.ndarray:
+    """
+    Normalize IQ signal to unit RMS.
+    This removes amplitude variations between recordings.
+    """
+    rms = np.sqrt(np.mean(np.abs(iq) ** 2))
+    if rms < 1e-12:
+        LOGGER.warning("IQ signal has near-zero RMS, skipping normalization")
+        return iq
+    return iq / rms
+
+
+def downsample_iq(iq: np.ndarray, fs: float, target_fs: Optional[float]) -> Tuple[np.ndarray, float]:
+    """Downsample IQ to target_fs using resample_poly, if target_fs < fs."""
+    if target_fs is None or target_fs <= 0 or target_fs >= fs:
+        return iq, fs
+
+    ratio = target_fs / fs
+    if ratio <= 0:
+        raise ValueError(f"Invalid target_fs/fs ratio: target_fs={target_fs}, fs={fs}")
+
+    # Find small-integer up/down for resample_poly with adaptive search range
+    max_search = max(100, int(1.0 / ratio) + 50)
+    best_up, best_down = 1, max(int(round(1.0 / ratio)), 1)
+    best_err = abs(ratio - best_up / best_down)
+
+    for down in range(1, min(max_search, 200)):
+        up = int(round(ratio * down))
+        if up < 1:
+            continue
+        err = abs(ratio - up / down)
+        if err < best_err:
+            best_err, best_up, best_down = err, up, down
+        # Stop if we found a very good approximation
+        if err < 1e-6:
+            break
+    
+    # Guard: warn if approximation error is too high
+    if best_err > MAX_DOWNSAMPLE_ERROR:
+        LOGGER.warning(
+            "Downsample ratio approximation error %.4f (%.2f%%) exceeds threshold %.2f%%. "
+            "Consider using a different target_fs_hz for cleaner integer ratios.",
+            best_err, best_err * 100, MAX_DOWNSAMPLE_ERROR * 100
+        )
+
+    iq_ds = resample_poly(iq, best_up, best_down).astype(np.complex64)
+    fs_ds = fs * best_up / best_down
+
+    LOGGER.debug(
+        "Downsampled IQ from fs=%.3f MHz to fs_eff=%.3f MHz using up=%d, down=%d (ratio=%.5f, err=%.2e).",
+        fs / 1e6,
+        fs_ds / 1e6,
+        best_up,
+        best_down,
+        best_up / best_down,
+        best_err,
+    )
+
+    return iq_ds, fs_ds
+
+
+def spectral_entropy(psd: np.ndarray) -> float:
+    p = psd / (np.sum(psd) + 1e-12)
+    return float(-np.sum(p * np.log(p + 1e-12)))
+
+
+def spectral_flatness(psd: np.ndarray) -> float:
+    gmean = np.exp(np.mean(np.log(psd + 1e-12)))
+    amean = np.mean(psd) + 1e-12
+    return float(gmean / amean)
+
+
+def extract_features_from_window(x: np.ndarray, fs: float, cfg: FeatureConfig) -> np.ndarray:
+    """
+    x: complex IQ window
+    Returns feature vector (float64).
+
+    Features:
+      - total power (dB)
+      - noise floor proxy (median PSD, dB)
+      - spectral entropy
+      - spectral flatness
+      - PSD variance (in dB)
+      - amplitude kurtosis
+      - amplitude std
+    """
+    if x.size < 16:
+        raise ValueError("IQ window too short for feature extraction.")
+
+    # time-domain features
+    amp = np.abs(x)
+    amp_std = float(np.std(amp))
+    try:
+        amp_kurt = float(kurtosis(amp, fisher=False, bias=False))
+    except (ValueError, RuntimeWarning) as e:
+        LOGGER.warning(
+            "Kurtosis calculation failed (%s), using Gaussian default (3.0). "
+            "Window size: %d", str(e), x.size
+        )
+        amp_kurt = 3.0  # fallback to Gaussian kurtosis
+
+    # spectral features using Welch
+    nperseg = min(cfg.welch_nperseg, x.size)
+    noverlap = min(cfg.welch_noverlap, max(0, nperseg - 1))
+
+    # Robust Welch: compute PSD of Real and Imag separately and sum
+    # This avoids complex-signal ambiguities and ensures stability
+    f, psd_i = welch(
+        np.real(x),
+        fs=fs,
+        nperseg=nperseg,
+        noverlap=noverlap,
+        return_onesided=False,
+        scaling="density",
+    )
+    _, psd_q = welch(
+        np.imag(x),
+        fs=fs,
+        nperseg=nperseg,
+        noverlap=noverlap,
+        return_onesided=False,
+        scaling="density",
+    )
+    psd = psd_i + psd_q
+    psd = np.abs(psd).astype(np.float64) + 1e-18
+
+    total_power = float(10.0 * np.log10(np.mean(amp ** 2) + 1e-18))
+    noise_floor = float(10.0 * np.log10(np.median(psd) + 1e-18))
+    ent = spectral_entropy(psd)
+    flat = spectral_flatness(psd)
+    psd_db = 10.0 * np.log10(psd + 1e-18)
+    psd_var = float(np.var(psd_db))
+
+    feat = np.array(
+        [total_power, noise_floor, ent, flat, psd_var, amp_kurt, amp_std],
+        dtype=np.float64,
+    )
+
+    if not np.all(np.isfinite(feat)):
+        raise ValueError("Non-finite feature values encountered (NaN/Inf).")
+
+    return feat
+
+
+def window_iq(iq: np.ndarray, fs: float, cfg: FeatureConfig) -> np.ndarray:
+    """Slice IQ into windows and extract features per window."""
+    if iq.size == 0:
+        raise ValueError("Empty IQ array.")
+
+    win_len = int(round(cfg.win_ms * 1e-3 * fs))
+    hop_len = int(round(cfg.hop_ms * 1e-3 * fs))
+    win_len = max(win_len, cfg.min_win_samples)
+    hop_len = max(hop_len, 1)  # Ensure positive hop
+    
+    # Warn about overlapping windows (correlated samples)
+    if hop_len < win_len:
+        LOGGER.warning(
+            "Overlapping windows detected (hop=%d < win=%d). "
+            "This creates correlated samples; consider hop_ms >= win_ms for independence.",
+            hop_len, win_len
+        )
+
+    n = iq.size
+    if n < win_len:
+        raise ValueError(
+            f"IQ length ({n}) shorter than window length ({win_len}). "
+            f"Consider reducing win_ms or disabling downsampling."
+        )
+
+    feats: List[np.ndarray] = []
+    idx = 0
+    count = 0
+
+    while idx + win_len <= n and count < cfg.max_windows_per_file:
+        xw = iq[idx: idx + win_len]
+        feat = extract_features_from_window(xw, fs, cfg)
+        feats.append(feat)
+        idx += hop_len
+        count += 1
+
+    if not feats:
+        raise ValueError("No windows extracted; adjust win_ms/hop_ms or check IQ length.")
+
+    X = np.vstack(feats)
+    return X  # shape: (n_windows, d)
+
+
+# -------------------------
+# Mahalanobis detector
+# -------------------------
+
+@dataclass
+class Detector:
+    scaler: StandardScaler
+    cov: LedoitWolf
+    mu: np.ndarray
+
+    def score(self, X: np.ndarray) -> np.ndarray:
+        """
+        Return squared Mahalanobis distance for each row in X.
+        """
+        if X.ndim != 2:
+            raise ValueError(f"Expected 2D feature matrix, got shape {X.shape}")
+        Xs = self.scaler.transform(X)
+        diff = Xs - self.mu
+        P = self.cov.precision_
+        d2 = np.einsum("...i,ij,...j->...", diff, P, diff)
+        return d2
+
+
+def validate_feature_matrix(X: np.ndarray, name: str) -> None:
+    if X.ndim != 2:
+        raise ValueError(f"{name} must be 2D, got shape {X.shape}")
+    if X.size == 0:
+        raise ValueError(f"{name} is empty.")
+    if not np.all(np.isfinite(X)):
+        raise ValueError(f"{name} contains non-finite values (NaN/Inf).")
+
+
+def train_detector(X_nom: np.ndarray) -> Detector:
+    validate_feature_matrix(X_nom, "Nominal feature matrix")
+
+    scaler = StandardScaler()
+    Xs = scaler.fit_transform(X_nom)
+
+    cov = LedoitWolf().fit(Xs)
+    mu = cov.location_.copy()  # use estimator's internal mean
+
+    if not np.all(np.isfinite(mu)):
+        raise ValueError("Estimated mean vector contains non-finite values.")
+    if not np.all(np.isfinite(cov.precision_)):
+        raise ValueError("Estimated precision matrix contains non-finite values.")
+
+    LOGGER.info(
+        "Trained Mahalanobis detector on %d windows, feature_dim=%d.",
+        X_nom.shape[0],
+        X_nom.shape[1],
+    )
+
+    return Detector(scaler=scaler, cov=cov, mu=mu)
+
+
+def process_files_and_extract_features(
+    files: List[Tuple[str, int]],
+    cfg: FeatureConfig,
+    desc: str = "files",
+    auto_fs: bool = False,
+    do_normalize_rms: bool = False,
+) -> Tuple[List[np.ndarray], List[str]]:
+    """
+    Process a list of MAT files, load IQ, and extract windowed features.
+    
+    Args:
+        files: List of (file_path, category) tuples
+        cfg: Feature extraction config
+        desc: Description for logging
+        auto_fs: If True, use category-based fs instead of cfg.fs_hz
+        do_normalize_rms: If True, normalize IQ to unit RMS before processing
+    
+    Returns (list_of_feature_matrices, list_of_bad_files).
+    """
+    X_list: List[np.ndarray] = []
+    bad_files: List[str] = []
+
+    for i, (fp, category) in enumerate(files):
+        try:
+            # Determine sampling rate
+            fs = CATEGORY_FS_HZ.get(category, cfg.fs_hz) if auto_fs else cfg.fs_hz
+            
+            iq, meta = load_iq_from_mat(fp)
+            
+            # Optional RMS normalization
+            if do_normalize_rms:
+                iq = normalize_rms(iq)
+            
+            iq, fs_eff = downsample_iq(iq, fs, cfg.target_fs_hz)
+            Xi = window_iq(iq, fs_eff, cfg)
+            validate_feature_matrix(Xi, f"Features from {desc} file {fp}")
+            X_list.append(Xi)
+        except Exception as e:
+            LOGGER.warning("Skipping %s file %s due to error: %s", desc, fp, e)
+            bad_files.append(fp)
+            continue
+
+        if (i + 1) % 10 == 0:
+            LOGGER.info("Processed %d/%d %s files.", i + 1, len(files), desc)
+
+    return X_list, bad_files
+
+
+def write_summary(
+    outdir: str,
+    scores_nom: np.ndarray,
+    scores_spoof: np.ndarray,
+    thr: float,
+    threshold_quantile: float,
+    n_train_files: int,
+    n_test_files: int,
+    n_train_scored: Optional[int] = None,
+    n_test_scored: Optional[int] = None,
+    filemax_nom: Optional[np.ndarray] = None,
+    filemax_spoof: Optional[np.ndarray] = None,
+    categories: Optional[List[int]] = None,
+) -> None:
+    """
+    Write summary.txt with detection metrics.
+    """
+    # Compute metrics
+    far = float((scores_nom > thr).mean())  # False alarm rate
+    tpr = float((scores_spoof > thr).mean())  # True positive rate (detection rate)
+    
+    # Also compute at a few other thresholds for reference
+    thresholds_q = [0.90, 0.95, 0.99, 0.995, 0.999]
+    
+    summary_path = os.path.join(outdir, "summary.txt")
+    
+    with open(summary_path, 'w') as f:
+        f.write("=" * 60 + "\n")
+        f.write("GNSS Mahalanobis Anomaly Detector - Results Summary\n")
+        f.write("=" * 60 + "\n\n")
+        
+        f.write("Dataset:\n")
+        
+        train_str = f"{n_train_files}"
+        if n_train_scored is not None:
+            train_str += f" (scored: {n_train_scored}, skipped: {n_train_files - n_train_scored})"
+        f.write(f"  Training files (clean): {train_str}\n")
+        
+        test_str = f"{n_test_files}"
+        if n_test_scored is not None:
+            test_str += f" (scored: {n_test_scored}, skipped: {n_test_files - n_test_scored})"
+        f.write(f"  Test files (spoof): {test_str}\n")
+        
+        if categories:
+            f.write(f"  Categories: {categories}\n")
+        f.write(f"  Training windows: {len(scores_nom)}\n")
+        f.write(f"  Test windows: {len(scores_spoof)}\n\n")
+        
+        f.write(f"Threshold: {thr:.4f} (at {threshold_quantile*100:.1f}% quantile)\n\n")
+        
+        f.write("Performance at selected threshold:\n")
+        f.write(f"  False Alarm Rate (Windows): {far*100:.2f}%\n")
+        f.write(f"  True Positive Rate (Windows): {tpr*100:.2f}%\n")
+
+        if filemax_nom is not None and filemax_spoof is not None:
+            far_file = float((filemax_nom > thr).mean()) if filemax_nom.size else float("nan")
+            tpr_file = float((filemax_spoof > thr).mean()) if filemax_spoof.size else float("nan")
+            f.write(f"  False Alarm Rate (Files, max>thr): {far_file*100:.2f}%\n")
+            f.write(f"  True Positive Rate (Files, max>thr): {tpr_file*100:.2f}%\n")
+        
+        f.write("\n")
+        f.write("Threshold sensitivity (Window-level):\n")
+        f.write(f"  {'Quantile':>10} {'Threshold':>12} {'FAR':>10} {'TPR':>10}\n")
+        f.write("  " + "-" * 44 + "\n")
+        for q in thresholds_q:
+            t = float(np.quantile(scores_nom, q))
+            f_at_t = float((scores_nom > t).mean())
+            d_at_t = float((scores_spoof > t).mean())
+            f.write(f"  {q*100:>9.1f}% {t:>12.4f} {f_at_t*100:>9.2f}% {d_at_t*100:>9.2f}%\n")
+        
+        f.write("\n" + "=" * 60 + "\n")
+    
+    LOGGER.info("Saved summary to %s", summary_path)
+
+
+def score_files(
+    det: Detector,
+    files: List[Tuple[str, int]],
+    cfg: FeatureConfig,
+    desc: str,
+    auto_fs: bool,
+    do_normalize_rms: bool,
+) -> Tuple[np.ndarray, np.ndarray, List[str]]:
+    """
+    Score files and compute per-file aggregation metrics.
+    
+    Returns:
+        window_scores_all: Concatenated window scores across all processed files
+        file_max_scores: Max window score per processed file
+        bad_files: List of files skipped due to errors
+    """
+    window_scores_all: List[np.ndarray] = []
+    file_max_scores: List[float] = []
+    bad_files: List[str] = []
+
+    for i, (fp, category) in enumerate(files):
+        try:
+            fs = CATEGORY_FS_HZ.get(category, cfg.fs_hz) if auto_fs else cfg.fs_hz
+            iq, _ = load_iq_from_mat(fp)
+            if do_normalize_rms:
+                iq = normalize_rms(iq)
+
+            iq, fs_eff = downsample_iq(iq, fs, cfg.target_fs_hz)
+            X = window_iq(iq, fs_eff, cfg)
+            validate_feature_matrix(X, f"Features from {desc} file {fp}")
+
+            s = det.score(X)
+            if not np.all(np.isfinite(s)):
+                raise ValueError("Non-finite window scores.")
+
+            window_scores_all.append(s)
+            file_max_scores.append(float(np.max(s)))
+
+        except Exception as e:
+            LOGGER.warning("Skipping %s file %s due to error: %s", desc, fp, e)
+            bad_files.append(fp)
+        
+        if (i + 1) % 10 == 0:
+            LOGGER.info("Scored %d/%d %s files.", i + 1, len(files), desc)
+
+    if window_scores_all:
+        window_scores_arr = np.concatenate(window_scores_all, axis=0)
+        file_max_arr = np.array(file_max_scores, dtype=np.float64)
+    else:
+        window_scores_arr = np.array([], dtype=np.float64)
+        file_max_arr = np.array([], dtype=np.float64)
+
+    return window_scores_arr, file_max_arr, bad_files
+
+
+# -------------------------
+# Plotting helpers
+# -------------------------
+
+def plot_time_series(
+    scores_clean: np.ndarray,
+    scores_spoof: np.ndarray,
+    thr: float,
+    outdir: str,
+) -> None:
+    plt.figure()
+    plt.plot(scores_clean, label="Clean score")
+    plt.plot(scores_spoof, label="Spoof score")
+    plt.axhline(thr, linestyle="--", label=f"Threshold ({thr:.2f})")
+    plt.xlabel("Window index")
+    plt.ylabel(r"$D^2$ (Mahalanobis)")
+    plt.title("Mahalanobis score time series (example clean vs spoof)")
+    plt.legend()
+    os.makedirs(outdir, exist_ok=True)
+    out_path = os.path.join(outdir, "score_timeseries.png")
+    plt.savefig(out_path, dpi=200, bbox_inches="tight")
+    plt.close()
+    LOGGER.info("Saved time-series plot to %s", out_path)
+
+
+def plot_distributions(
+    scores_nom: np.ndarray,
+    scores_spoof: np.ndarray,
+    thr: float,
+    outdir: str,
+) -> None:
+    plt.figure()
+    plt.hist(scores_nom, bins=60, alpha=0.6, label="Nominal (clean)", density=True)
+    plt.hist(scores_spoof, bins=60, alpha=0.6, label="Spoof", density=True)
+    plt.axvline(thr, linestyle="--", label=f"Threshold ({thr:.2f})")
+    plt.xlabel(r"$D^2$ (Mahalanobis)")
+    plt.ylabel("Density")
+    plt.title("Score distributions: nominal vs spoof")
+    plt.legend()
+    os.makedirs(outdir, exist_ok=True)
+    out_path = os.path.join(outdir, "score_distributions.png")
+    plt.savefig(out_path, dpi=200, bbox_inches="tight")
+    plt.close()
+    LOGGER.info("Saved score distribution plot to %s", out_path)
+
+
+def plot_threshold_sweep(
+    scores_nom: np.ndarray,
+    scores_spoof: np.ndarray,
+    outdir: str,
+) -> None:
+    qs = np.linspace(0.90, 0.999, 30)
+    thrs = np.quantile(scores_nom, qs)
+
+    far = [(scores_nom > t).mean() for t in thrs]  # false alarm rate per-window
+    tpr = [(scores_spoof > t).mean() for t in thrs]  # detection rate per-window
+
+    plt.figure()
+    plt.plot(far, tpr, marker="o")
+    plt.xlabel("False alarm rate (nominal, per-window)")
+    plt.ylabel("Detection rate (spoof, per-window)")
+    plt.title("Threshold sensitivity (FAR vs detection)")
+    os.makedirs(outdir, exist_ok=True)
+    out_path = os.path.join(outdir, "threshold_sweep.png")
+    plt.savefig(out_path, dpi=200, bbox_inches="tight")
+    plt.close()
+    LOGGER.info("Saved threshold sweep plot to %s", out_path)
+
+
+# -------------------------
+# Main
+# -------------------------
+
+def main() -> int:
+    ap = argparse.ArgumentParser(
+        description="Nominal-only Mahalanobis anomaly detector on GNSS I/Q .mat dataset.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Train on oct_18, test on oct_19 (cross-day validation)
+  python %(prog)s --train_dir ./data/oct_18 --test_dir ./data/oct_19
+  
+  # Single directory mode (original behavior)
+  python %(prog)s --data_root ./data
+  
+  # Filter to specific categories
+  python %(prog)s --train_dir ./data/oct_18 --test_dir ./data/oct_19 --categories 1 3
+"""
+    )
+    
+    # Data source arguments (mutually exclusive modes)
+    data_group = ap.add_argument_group("Data Source")
+    data_group.add_argument(
+        "--data_root",
+        type=str,
+        default="",
+        help="Root folder for single-directory mode (train on S*, test on SS*).",
+    )
+    data_group.add_argument(
+        "--train_dir",
+        type=str,
+        default="",
+        help="Directory containing training data (clean S* files). For cross-day mode.",
+    )
+    data_group.add_argument(
+        "--test_dir",
+        type=str,
+        default="",
+        help="Directory containing test data (spoof SS* files). For cross-day mode.",
+    )
+    data_group.add_argument(
+        "--categories",
+        type=int,
+        nargs="+",
+        default=None,
+        help="Filter to specific categories (1=Baseline, 2=Multipath, 3=HighFs, 4=LowQuant).",
+    )
+    data_group.add_argument(
+        "--auto_fs",
+        action="store_true",
+        help="Auto-detect sampling rate from category (25MHz for 1,2,4; 50MHz for 3).",
+    )
+    data_group.add_argument(
+        "--normalize_rms",
+        action="store_true",
+        help="Normalize IQ to unit RMS before feature extraction (removes amplitude variations).",
+    )
+    
+    ap.add_argument(
+        "--fs_hz",
+        type=float,
+        default=25e6,
+        help="Sampling rate of the dataset in Hz (default 25e6).",
+    )
+    ap.add_argument(
+        "--target_fs_hz",
+        type=float,
+        default=5e6,
+        help="Downsample target fs for features (Hz). Use 0 or negative to disable.",
+    )
+    ap.add_argument(
+        "--win_ms",
+        type=float,
+        default=1.0,
+        help="Window length in ms (default 1.0).",
+    )
+    ap.add_argument(
+        "--hop_ms",
+        type=float,
+        default=1.0,
+        help="Hop length in ms (default 1.0).",
+    )
+    ap.add_argument(
+        "--max_windows",
+        type=int,
+        default=200,
+        help="Max windows per file (compute control).",
+    )
+    ap.add_argument(
+        "--max_train_files",
+        type=int,
+        default=80,
+        help="Limit number of training (clean) files for speed.",
+    )
+    ap.add_argument(
+        "--max_test_files",
+        type=int,
+        default=80,
+        help="Limit number of spoof/test files for speed.",
+    )
+    ap.add_argument(
+        "--example_clean",
+        type=str,
+        default="",
+        help="Path to a specific clean .mat to use for example time-series plot (optional).",
+    )
+    ap.add_argument(
+        "--example_spoof",
+        type=str,
+        default="",
+        help="Path to a specific spoof .mat to use for example time-series plot (optional).",
+    )
+    ap.add_argument(
+        "--min_win_samples",
+        type=int,
+        default=1024,
+        help="Minimum window size in samples (default 1024).",
+    )
+    ap.add_argument(
+        "--threshold_quantile",
+        type=float,
+        default=0.995,
+        help="Quantile of nominal scores to use as threshold (default 0.995 = 99.5%%).",
+    )
+    ap.add_argument(
+        "--outdir",
+        type=str,
+        default="outputs_mahalanobis",
+        help="Output directory for plots and .npy files.",
+    )
+    ap.add_argument(
+        "--log_level",
+        type=str,
+        default="INFO",
+        help="Logging level: DEBUG, INFO, WARNING, ERROR, CRITICAL.",
+    )
+
+    args = ap.parse_args()
+
+    setup_logging(args.log_level)
+    
+    # Determine mode: cross-day or single-directory
+    cross_day_mode = bool(args.train_dir and args.test_dir)
+    single_dir_mode = bool(args.data_root)
+    
+    if not cross_day_mode and not single_dir_mode:
+        LOGGER.error("Must specify either --data_root OR both --train_dir and --test_dir")
+        return 1
+    
+    if cross_day_mode and single_dir_mode:
+        LOGGER.warning("Both --data_root and --train_dir/--test_dir specified. Using cross-day mode.")
+
+    # Validate threshold_quantile
+    if not (0.0 < args.threshold_quantile < 1.0):
+        LOGGER.error("--threshold_quantile must be between 0 and 1, got %.3f", args.threshold_quantile)
+        return 1
+
+    target_fs = None if args.target_fs_hz <= 0 else float(args.target_fs_hz)
+
+    cfg = FeatureConfig(
+        fs_hz=float(args.fs_hz),
+        win_ms=float(args.win_ms),
+        hop_ms=float(args.hop_ms),
+        max_windows_per_file=int(args.max_windows),
+        target_fs_hz=target_fs,
+        min_win_samples=int(args.min_win_samples),
+    )
+
+    LOGGER.info("Using FeatureConfig: %s", cfg)
+    LOGGER.info("Feature names: %s", FEATURE_NAMES)
+    
+    if args.auto_fs:
+        LOGGER.info("Auto-fs enabled: will use category-based sampling rates")
+
+    # ---- Discover files based on mode
+    if cross_day_mode:
+        LOGGER.info("Cross-day mode: train_dir=%s, test_dir=%s", args.train_dir, args.test_dir)
+        
+        # Training: clean files from train_dir
+        train_clean, train_spoof = find_mat_files(args.train_dir, args.categories)
+        # Testing: spoof files from test_dir
+        test_clean, test_spoof = find_mat_files(args.test_dir, args.categories)
+        
+        clean_files = train_clean  # Train on clean from day 1
+        spoof_files = test_spoof   # Test on spoof from day 2
+        
+        LOGGER.info(
+            "Cross-day split: %d train clean (day 1), %d test spoof (day 2)",
+            len(clean_files), len(spoof_files)
+        )
+    else:
+        # Single directory mode (original behavior)
+        clean_files, spoof_files = find_mat_files(args.data_root, args.categories)
+        
+    if not clean_files:
+        LOGGER.error("No matching S*.mat clean files found.")
+        return 1
+    if not spoof_files:
+        LOGGER.error("No matching SS*.mat spoof files found.")
+        return 1
+
+    # Apply file limits
+    clean_files = clean_files[: args.max_train_files]
+    spoof_files = spoof_files[: args.max_test_files]
+
+    LOGGER.info(
+        "Using %d clean files for training, %d spoof files for testing.",
+        len(clean_files),
+        len(spoof_files),
+    )
+
+    # ---- Build training matrix from clean files
+    X_nom_list, bad_clean = process_files_and_extract_features(
+        clean_files, cfg, "clean", 
+        auto_fs=args.auto_fs, 
+        do_normalize_rms=args.normalize_rms
+    )
+
+    if not X_nom_list:
+        LOGGER.error("No valid clean files were processed; cannot train detector.")
+        return 1
+
+    X_nom = np.vstack(X_nom_list)
+    LOGGER.info(
+        "Nominal training windows: %d, feature dim: %d. Skipped %d clean files.",
+        X_nom.shape[0],
+        X_nom.shape[1],
+        len(bad_clean),
+    )
+
+    # Train detector on features (standardization + Ledoit-Wolf covariance)
+    det = train_detector(X_nom)
+    
+    # Compute nominal scores efficiently from already-loaded features
+    scores_nom = det.score(X_nom)
+    
+    if not scores_nom.size:
+        LOGGER.error("No nominal scores computed; cannot set threshold.")
+        return 1
+
+    if not np.all(np.isfinite(scores_nom)):
+        raise ValueError("Non-finite nominal scores (NaN/Inf) after detector scoring.")
+
+    # Compute file-level max scores for nominal data without reloading
+    filemax_nom_list = []
+    current_idx = 0
+    for Xi in X_nom_list:
+        n_wins = Xi.shape[0]
+        s_file = scores_nom[current_idx : current_idx + n_wins]
+        if s_file.size > 0:
+            filemax_nom_list.append(float(np.max(s_file)))
+        current_idx += n_wins
+    filemax_nom = np.array(filemax_nom_list)
+    
+    # Choose threshold
+    thr = float(np.quantile(scores_nom, args.threshold_quantile))
+    LOGGER.info(
+        "Threshold set at nominal %.1f%% quantile: %.3f",
+        args.threshold_quantile * 100,
+        thr,
+    )
+
+    # Score spoof/test data
+    scores_spoof, filemax_spoof, bad_spoof = score_files(
+        det, spoof_files, cfg, "spoof", 
+        auto_fs=args.auto_fs, 
+        do_normalize_rms=args.normalize_rms
+    )
+
+    if not scores_spoof.size:
+        LOGGER.error("No valid spoof scores; cannot evaluate detector.")
+        return 1
+
+    LOGGER.info(
+        "Spoof/test windows: %d. Skipped %d spoof files.",
+        scores_spoof.shape[0],
+        len(bad_spoof),
+    )
+    
+    # Log quick stats
+    far_file = float((filemax_nom > thr).mean()) if filemax_nom.size else 0.0
+    tpr_file = float((filemax_spoof > thr).mean()) if filemax_spoof.size else 0.0
+    LOGGER.info("FILE-level FAR (max>thr): %.2f%%", far_file * 100)
+    LOGGER.info("FILE-level TPR (max>thr): %.2f%%", tpr_file * 100)
+
+    # ---- Plots and Summary
+    os.makedirs(args.outdir, exist_ok=True)
+    
+    # Write metrics summary
+    write_summary(
+        outdir=args.outdir,
+        scores_nom=scores_nom,
+        scores_spoof=scores_spoof,
+        thr=thr,
+        threshold_quantile=args.threshold_quantile,
+        n_train_files=len(clean_files),
+        n_test_files=len(spoof_files),
+        n_train_scored=len(X_nom_list),
+        n_test_scored=len(filemax_spoof),
+        filemax_nom=filemax_nom,
+        filemax_spoof=filemax_spoof,
+        categories=args.categories,
+    )
+    
+    plot_distributions(scores_nom, scores_spoof, thr, args.outdir)
+    plot_threshold_sweep(scores_nom, scores_spoof, args.outdir)
+
+    # Example time-series (validated earlier that lists are non-empty)
+    ex_clean = args.example_clean if args.example_clean else clean_files[0]
+    ex_spoof = args.example_spoof if args.example_spoof else spoof_files[0]
+
+    # Validate example files exist
+    if args.example_clean and not os.path.isfile(args.example_clean):
+        LOGGER.warning("Specified --example_clean does not exist: %s", args.example_clean)
+        ex_clean = clean_files[0]
+    if args.example_spoof and not os.path.isfile(args.example_spoof):
+        LOGGER.warning("Specified --example_spoof does not exist: %s", args.example_spoof)
+        ex_spoof = spoof_files[0]
+
+    LOGGER.info("Generating time-series example with clean=%s, spoof=%s", ex_clean, ex_spoof)
+
+    try:
+        # Extract path and category from (path, cat) tuples
+        if isinstance(ex_clean, tuple):
+            ex_clean_path, ex_clean_cat = ex_clean
+        else:
+            ex_clean_path = ex_clean
+            m = MAT_RE.match(os.path.basename(ex_clean))
+            if m:
+                ex_clean_cat = int(m.group(2))
+            else:
+                ex_clean_cat = None
+                LOGGER.warning("Could not parse category from %s, using cfg.fs_hz", ex_clean)
+        
+        if isinstance(ex_spoof, tuple):
+            ex_spoof_path, ex_spoof_cat = ex_spoof
+        else:
+            ex_spoof_path = ex_spoof
+            m = MAT_RE.match(os.path.basename(ex_spoof))
+            if m:
+                ex_spoof_cat = int(m.group(2))
+            else:
+                ex_spoof_cat = None
+                LOGGER.warning("Could not parse category from %s, using cfg.fs_hz", ex_spoof)
+        
+        # Use category-based fs if auto_fs enabled and category was successfully parsed
+        fs_clean = CATEGORY_FS_HZ.get(ex_clean_cat, cfg.fs_hz) if (args.auto_fs and ex_clean_cat is not None) else cfg.fs_hz
+        fs_spoof = CATEGORY_FS_HZ.get(ex_spoof_cat, cfg.fs_hz) if (args.auto_fs and ex_spoof_cat is not None) else cfg.fs_hz
+        
+        iqc, _ = load_iq_from_mat(ex_clean_path)
+        if args.normalize_rms:
+            iqc = normalize_rms(iqc)
+        iqc, fs_eff_c = downsample_iq(iqc, fs_clean, cfg.target_fs_hz)
+        Xc = window_iq(iqc, fs_eff_c, cfg)
+        sc = det.score(Xc)
+
+        iqs, _ = load_iq_from_mat(ex_spoof_path)
+        if args.normalize_rms:
+            iqs = normalize_rms(iqs)
+        iqs, fs_eff_s = downsample_iq(iqs, fs_spoof, cfg.target_fs_hz)
+        Xs = window_iq(iqs, fs_eff_s, cfg)
+        ss = det.score(Xs)
+
+        if np.all(np.isfinite(sc)) and np.all(np.isfinite(ss)):
+            plot_time_series(sc, ss, thr, args.outdir)
+        else:
+            LOGGER.warning("Skipping time-series plot due to non-finite scores in example files.")
+
+    except Exception as e:
+        LOGGER.warning("Failed to generate time-series plot: %s", e)
+
+    # Save raw score arrays (useful for later analysis)
+    np.save(os.path.join(args.outdir, "scores_nominal.npy"), scores_nom)
+    np.save(os.path.join(args.outdir, "scores_spoof.npy"), scores_spoof)
+
+    LOGGER.info("Done. Outputs saved in: %s", args.outdir)
+    LOGGER.info(
+        "Generated files:\n"
+        "  - score_distributions.png\n"
+        "  - threshold_sweep.png\n"
+        "  - score_timeseries.png (if successful)\n"
+        "  - scores_nominal.npy\n"
+        "  - scores_spoof.npy"
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    import sys
+    sys.exit(main())
