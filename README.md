@@ -2,6 +2,7 @@
 
 A robust, nominal-only anomaly detector for GNSS I/Q data using interpretable RF features and Mahalanobis distance.
 
+DATASET https://zenodo.org/records/13846381
 ## 🚀 Key Features
 
 - **Nominal-Only Training**: Trains on clean signals (`S*.mat`), detects anomalies in spoofed signals (`SS*.mat`).
